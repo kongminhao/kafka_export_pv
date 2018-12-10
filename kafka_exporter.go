@@ -49,6 +49,8 @@ var (
 // the prometheus metrics package.
 type Exporter struct {
 	client          sarama.Client
+	reachableClient sarama.Client
+	config 			*sarama.Config
 	topicFilter     *regexp.Regexp
 	groupFilter     *regexp.Regexp
 	mu              sync.Mutex
@@ -176,6 +178,8 @@ func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Expor
 	// Init our exporter.
 	return &Exporter{
 		client:          client,
+		reachableClient: client,
+		config:          config,
 		topicFilter:     regexp.MustCompile(topicFilter),
 		groupFilter:     regexp.MustCompile(groupFilter),
 		useZooKeeperLag: opts.useZooKeeperLag,
@@ -207,16 +211,40 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	var wg = sync.WaitGroup{}
 	var wgGetPartitionGroup = sync.WaitGroup{}
-	ch <- prometheus.MustNewConstMetric(
-		clusterBrokers, prometheus.GaugeValue, float64(len(e.client.Brokers())),
-	)
+	var reachableClientAddr []string = make([]string, 3)
+	var flag bool = true
+	for _, broker := range e.client.Brokers(){
 
+		if err := broker.Open(e.client.Config()); err != nil && err != sarama.ErrAlreadyConnected {
+			continue
+		}
+		reachableClientAddr = append(reachableClientAddr, broker.Addr())
+	}
+	if len(reachableClientAddr) != len(e.reachableClient.Brokers()){
+		reachableClient, err := sarama.NewClient(reachableClientAddr, e.config)
+		if err != nil{
+			plog.Errorln("Error Init Kafka Client")
+			flag = false
+			ch <- prometheus.MustNewConstMetric(
+				clusterBrokers, prometheus.GaugeValue, float64(0),
+			)
+		}
+		if err == nil{
+			e.reachableClient = reachableClient
+		}
+	}
+
+	if flag {
+		ch <- prometheus.MustNewConstMetric(
+			clusterBrokers, prometheus.GaugeValue, float64(len(e.reachableClient.Brokers())),
+		)
+	}
 	offset := make(map[string]map[int32]int64)
 
-	if err := e.client.RefreshMetadata(); err != nil {
+	if err := e.reachableClient.RefreshMetadata(); err != nil {
 		plog.Errorf("Cannot refresh topics, using cached data: %v", err)
 	}
-	topics, err := e.client.Topics()
+	topics, err := e.reachableClient.Topics()
 	if err != nil {
 		plog.Errorf("Cannot get topics: %v", err)
 		return
@@ -225,7 +253,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	getTopicMetrics := func(topic string) {
 		defer wg.Done()
 		if e.topicFilter.MatchString(topic) {
-			partitions, err := e.client.Partitions(topic)
+			partitions, err := e.reachableClient.Partitions(topic)
 			if err != nil {
 				plog.Errorf("Cannot get partitions of topic %s: %v", topic, err)
 				return
@@ -238,7 +266,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			e.mu.Unlock()
 			getPartitionInfo := func(partition int32) {
 				defer wgGetPartitionGroup.Done()
-				broker, err := e.client.Leader(topic, partition)
+				broker, err := e.reachableClient.Leader(topic, partition)
 				if err != nil {
 					plog.Errorf("Cannot get leader of topic %s partition %d: %v", topic, partition, err)
 					return // if can not find leader, I don't care about other info, you can change this
@@ -248,7 +276,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 					)
 				}
 
-				currentOffset, err := e.client.GetOffset(topic, partition, sarama.OffsetNewest)
+				currentOffset, err := e.reachableClient.GetOffset(topic, partition, sarama.OffsetNewest)
 				if err != nil {
 					plog.Errorf("Cannot get current offset of topic %s partition %d: %v", topic, partition, err)
 				} else {
@@ -260,7 +288,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 					)
 				}
 
-				oldestOffset, err := e.client.GetOffset(topic, partition, sarama.OffsetOldest)
+				oldestOffset, err := e.reachableClient.GetOffset(topic, partition, sarama.OffsetOldest)
 				if err != nil {
 					plog.Errorf("Cannot get oldest offset of topic %s partition %d: %v", topic, partition, err)
 				} else {
@@ -269,7 +297,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 					)
 				}
 
-				replicas, err := e.client.Replicas(topic, partition)
+				replicas, err := e.reachableClient.Replicas(topic, partition)
 				if err != nil {
 					plog.Errorf("Cannot get replicas of topic %s partition %d: %v", topic, partition, err)
 				} else {
@@ -278,7 +306,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 					)
 				}
 
-				inSyncReplicas, err := e.client.InSyncReplicas(topic, partition)
+				inSyncReplicas, err := e.reachableClient.InSyncReplicas(topic, partition)
 				if err != nil {
 					plog.Errorf("Cannot get in-sync replicas of topic %s partition %d: %v", topic, partition, err)
 				} else {
@@ -343,7 +371,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 	getConsumerGroupMetrics := func(broker *sarama.Broker) {
 		defer wg.Done()
-		if err := broker.Open(e.client.Config()); err != nil && err != sarama.ErrAlreadyConnected {
+		if err := broker.Open(e.reachableClient.Config()); err != nil && err != sarama.ErrAlreadyConnected {
 			plog.Errorf("Cannot connect to broker %d: %v", broker.ID(), err)
 			return
 		}
@@ -434,8 +462,8 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	if len(e.client.Brokers()) > 0 {
-		for _, broker := range e.client.Brokers() {
+	if len(e.reachableClient.Brokers()) > 0 {
+		for _, broker := range e.reachableClient.Brokers() {
 			wg.Add(1)
 			go getConsumerGroupMetrics(broker)
 		}
